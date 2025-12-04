@@ -9,9 +9,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import random
 import re
-import yt_dlp
 import shutil
 import html
+from bs4 import BeautifulSoup
+import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+
+# Configuration
 
 
 
@@ -29,10 +33,10 @@ try:
 except ImportError:
     raise RuntimeError("openai package required. pip install openai")
 
-MODEL = os.getenv("MODEL", "llama3.1")
+MODEL = os.getenv("MODEL", "local-model")
 client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama", # required but unused
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio", # required but unused
 )
 
 SUGGEST_URL = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&gl=IN&hl=en-IN&q={}"
@@ -92,6 +96,7 @@ def retry_with_backoff(retries=5, backoff_in_seconds=5):
 
 # --- Core Functions ---
 
+@retry_with_backoff(retries=3, backoff_in_seconds=2)
 def get_suggestions(keyword: str):
     """Return list of suggestions from suggestqueries endpoint."""
     try:
@@ -101,7 +106,17 @@ def get_suggestions(keyword: str):
         data = resp.json()
         return data[1] if len(data) > 1 else []
     except Exception as e:
+        # logger.warning(f"Suggestion fetch failed: {e}") # Optional: reduce log noise
         return []
+
+def repair_json(text):
+    """Attempt to repair broken JSON."""
+    text = text.strip()
+    # Fix trailing commas
+    text = re.sub(r',\s*([\]}])', r'\1', text)
+    # Fix unquoted keys (simple case)
+    # text = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', text)
+    return text
 
 def clean_json_text(text):
     """Attempt to clean JSON text from LLM output."""
@@ -115,36 +130,194 @@ def clean_json_text(text):
     if start != -1 and end != -1:
         text = text[start:end]
     
-    # Attempt to fix common issues like unescaped newlines in strings
-    # This is tricky without a proper parser, but let's try a simple pass
-    # or just rely on the model being better if we prompt it better?
-    # For now, let's just return the extracted block.
+    text = repair_json(text)
+    text = repair_json(text)
     return text
 
+def call_llm_with_json_retry(system_prompt, user_prompt, model=MODEL, max_retries=2, validation_callback=None):
+    """
+    Call LLM and retry with error message if JSON parsing fails OR if validation fails.
+    validation_callback: function(dict) -> bool. Returns True if JSON is semantically valid.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                timeout=300,
+            )
+            text = response.choices[0].message.content
+            cleaned_text = clean_json_text(text)
+            
+            # Try parsing
+            try:
+                data = json.loads(cleaned_text)
+                
+                # Optional Semantic Validation
+                if validation_callback:
+                    if not validation_callback(data):
+                        raise ValueError("JSON is valid but failed semantic validation (missing keys?).")
+                
+                return data
+                
+            except (json.JSONDecodeError, ValueError) as e:
+                # If it's the last attempt, raise or return empty
+                if attempt == max_retries:
+                    logger.warning(f"Final JSON parse/validation failed: {e}")
+                    logger.warning(f"Failed text was: {text[:1000]}...") # Log the text for debugging
+                    raise
+                
+                # Otherwise, feed back the error
+                logger.warning(f"JSON parse/validation failed (Attempt {attempt+1}/{max_retries+1}). Asking LLM to fix...")
+                error_feedback = f"Your previous response was invalid or incomplete. Error: {e}. \nResponse was: {text[:500]}...\n\nPlease fix it and regenerate the COMPLETE response as valid JSON. Do not return a partial fix."
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": error_feedback})
+                
+        except Exception as e:
+            logger.warning(f"LLM call failed: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(2)
+            
+    return {}
+
+@retry_with_backoff(retries=3, backoff_in_seconds=5)
 def validate_video_availability(url):
-    """Check if video is available/accessible using yt-dlp simulation."""
-    ydl_opts = {
-        'quiet': True,
-        'simulate': True,
-        'skip_download': True,
-    }
+    """Check if video is available/accessible using requests."""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=False)
+        # Allow redirects to catch "Sign in" pages which mean private/restricted
+        response = requests.head(url, allow_redirects=True, timeout=5)
+        
+        if response.status_code != 200:
+            return False
+            
+        # Check if redirected to a login page or something that isn't a video
+        if "google.com/accounts" in response.url or "youtube.com/login" in response.url:
+            return False
+            
         return True
     except Exception as e:
         logger.warning(f"Video validation failed for {url}: {e}")
         return False
 
-def fetch_video_data(video_id: str):
-    """Fetch video description and transcript using yt-dlp with retries and fallback."""
+@retry_with_backoff(retries=3, backoff_in_seconds=5)
+def fetch_video_data_bs4(video_id: str):
+    """Fetch video metadata using BeautifulSoup (Scraping)."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     
-    # Rate limit delay
-    time.sleep(random.uniform(0.8, 1.5))
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch video page: {response.status_code}")
+            return None, None, 0
+            
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 1. Title
+        title = ""
+        meta_title = soup.find("meta", property="og:title")
+        if meta_title:
+            title = meta_title["content"]
+        else:
+            title_tag = soup.find("title")
+            if title_tag:
+                title = title_tag.text.replace(" - YouTube", "")
+        
+        # 2. Description
+        description = ""
+        meta_desc = soup.find("meta", property="og:description")
+        if meta_desc:
+            description = meta_desc["content"]
+        
+        # 3. Duration (Tricky with BS4, usually in a script tag)
+        # We'll try to find it in the meta tag 'duration' if available, or regex the script
+        duration = 0
+        # Try to find duration in meta itemprop="duration" content="PT..."
+        meta_duration = soup.find("meta", itemprop="duration")
+        if meta_duration:
+            duration_iso = meta_duration["content"]
+            # Parse ISO duration manually since we removed isodate
+            # Format: PT1H2M10S
+            import re
+            match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration_iso)
+            if match:
+                h = int(match.group(1) or 0)
+                m = int(match.group(2) or 0)
+                s = int(match.group(3) or 0)
+                duration = h * 3600 + m * 60 + s
+        
+        return description, title, duration
+
+    except Exception as e:
+        logger.error(f"BS4 Scraping failed: {e}")
+        return None, None, 0
+
+@retry_with_backoff(retries=3, backoff_in_seconds=5)
+def fetch_transcript_api(video_id: str):
+    """Fetch transcript using youtube-transcript-api with robust fallback."""
+    try:
+        # 1. List all available transcripts (Using .list() as verified in tests)
+        # Note: In this version, it seems to be an instance method named 'list'
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        
+        target_transcript = None
+        
+        # 2. Try to find Manually Created Hindi or English
+        try:
+            target_transcript = transcript_list.find_manually_created_transcript(['hi', 'en'])
+        except:
+            pass
+            
+        # 3. Try to find Generated Hindi or English
+        if not target_transcript:
+            try:
+                target_transcript = transcript_list.find_generated_transcript(['hi', 'en'])
+            except:
+                pass
+        
+        # 4. Fallback: Take ANY available transcript (first one)
+        if not target_transcript:
+            # transcript_list is iterable
+            for t in transcript_list:
+                target_transcript = t
+                break
+        
+        if target_transcript:
+            # Fetch the actual data
+            fetched_transcript = target_transcript.fetch()
+            # Concatenate text
+            full_text = " ".join([entry.text for entry in fetched_transcript.snippets])
+            return full_text
+            
+        return ""
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch transcript via API for {video_id}: {e}")
+        return ""
+
+def fetch_video_data(video_id: str):
+    """Fetch video description and transcript using BS4 (metadata) and youtube-transcript-api (transcript)."""
+    
+    # Rate limit is handled by decorators on called functions
+    # time.sleep(random.uniform(0.8, 1.5))
+    
+    description = ""
+    title = ""
+    duration = 0
+    transcript_text = ""
     
     url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # Decode HTML entities in URL just in case
     url = html.unescape(url)
     
     # 0. Validate first
@@ -152,111 +325,22 @@ def fetch_video_data(video_id: str):
         logger.error(f"Video {video_id} is unavailable or private.")
         return "", "", "", 0
 
-    ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitleslangs': ['en'],
-        'sleep_interval': 2,
-        'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
-    }
+    # 1. Fetch Metadata (BS4)
+    bs4_desc, bs4_title, bs4_duration = fetch_video_data_bs4(video_id)
+    if bs4_title:
+        description = bs4_desc
+        title = bs4_title
+        duration = bs4_duration
+        logger.info(f"Fetched metadata via BeautifulSoup for {video_id}")
+    else:
+        # Fallback if BS4 fails
+        logger.warning("BS4 failed to fetch metadata.")
+
+    # 2. Fetch Transcript (youtube-transcript-api)
+    transcript_text = fetch_transcript_api(video_id)
     
-    description = ""
-    transcript_text = ""
-    title = ""
-    duration = 0
-    
-    # Retry logic for metadata fetching
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                description = info.get('description', '')
-                title = info.get('title', '')
-                duration = info.get('duration', 0)
-                
-                subtitles = info.get('subtitles', {})
-                automatic_captions = info.get('automatic_captions', {})
-                
-                # Determine best language
-                available_langs = set(subtitles.keys()) | set(automatic_captions.keys())
-                selected_lang = 'en' # Default
-                
-                if 'hi' in available_langs:
-                    selected_lang = 'hi'
-                elif 'en' in available_langs:
-                    selected_lang = 'en'
-                elif available_langs:
-                    selected_lang = list(available_langs)[0]
-                    
-                logger.info(f"Selected language for transcript: {selected_lang}")
-                break # Success
-                
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"Metadata fetch failed for {video_id} (Attempt {attempt+1}/{max_retries}). Retrying in {wait_time:.1f}s... Error: {e}")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Error fetching metadata for {video_id} after retries: {e}")
-                return description, "", title, 0
-
-    # 2. Download transcript in selected language with fallback
-    try:
-        ydl_opts['skip_download'] = True
-        ydl_opts['writeautomaticsub'] = True
-        ydl_opts['writesubtitles'] = True
-        ydl_opts['subtitleslangs'] = [selected_lang]
-        ydl_opts['outtmpl'] = f'temp_{video_id}'
-        
-        # Retry logic for transcript download
-        for attempt in range(max_retries):
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(f"Transcript download failed (Attempt {attempt+1}). Retrying... Error: {e}")
-                    time.sleep(wait_time)
-                else:
-                    raise e
-
-        # Find the file
-        found_file = False
-        for ext in ['vtt', 'srv3', 'ttml']:
-            fname = f'temp_{video_id}.{selected_lang}.{ext}'
-            if os.path.exists(fname):
-                with open(fname, 'r', encoding='utf-8') as f:
-                    transcript_text = f.read()
-                os.remove(fname)
-                found_file = True
-                break
-            # Fallback naming check
-            fname_alt = f'temp_{video_id}.{ext}' 
-            if os.path.exists(fname_alt):
-                 with open(fname_alt, 'r', encoding='utf-8') as f:
-                    transcript_text = f.read()
-                 os.remove(fname_alt)
-                 found_file = True
-                 break
-        
-        if not found_file:
-            logger.warning(f"Transcript file not found for {video_id} after download.")
-
-        # Simple cleanup
-        if transcript_text:
-            transcript_text = re.sub(r'<[^>]+>', '', transcript_text)
-            transcript_text = re.sub(r'WEBVTT', '', transcript_text)
-            transcript_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', transcript_text)
-            transcript_text = re.sub(r'align:start position:0%', '', transcript_text)
-            transcript_text = "\n".join([line.strip() for line in transcript_text.split('\n') if line.strip()])
-        
-    except Exception as e:
-        logger.warning(f"Could not download transcript for {video_id}: {e}. Proceeding without transcript.")
+    if not transcript_text:
+        logger.warning(f"No transcript found for {video_id}. Proceeding without it.")
 
     return description, transcript_text, title, duration
 
@@ -271,8 +355,8 @@ def analyze_title_intent(title: str, transcript: str = ""):
     """Analyze title intent using Gemini/Ollama."""
     transcript_context = ""
     if transcript:
-        # Truncate transcript to avoid context limit issues (e.g. first 25000 chars)
-        transcript_context = f"\nVideo Transcript (excerpt): {transcript[:25000]}...\n"
+        # Truncate transcript to avoid context limit issues (e.g. first 10000 chars - approx 2500 tokens)
+        transcript_context = f"\nVideo Transcript (excerpt): {transcript[:10000]}...\n"
 
     system_prompt = (
         "You are an expert YouTube Strategist. "
@@ -305,27 +389,51 @@ def analyze_title_intent(title: str, transcript: str = ""):
     }}
     """
     
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.7,
-        timeout=60,
-    )
-    text = response.choices[0].message.content
-    cleaned_text = clean_json_text(text)
     try:
-        return json.loads(cleaned_text)
-    except json.JSONDecodeError:
-        # Try to use a more lenient parser if available, or just log and fail
-        # Let's try to strip control characters
-        cleaned_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_text)
+        return call_llm_with_json_retry(
+            system_prompt, 
+            user_prompt, 
+            validation_callback=lambda x: "primary_keyword" in x
+        )
+    except Exception as e:
+        logger.warning(f"LLM analysis failed with full context: {e}. Retrying with truncated context...")
+        # Fallback to smaller context
+        if transcript:
+            transcript_context = f"\nVideo Transcript (excerpt): {transcript[:5000]}...\n"
+            user_prompt = f"""
+            Old YouTube Title: "{title}"
+            {transcript_context}
+
+            Your task is to:
+            1. Infer the most likely topic of the video based on the TRANSCRIPT content.
+            2. Identify the primary keyword that best represents the actual content.
+            3. List 10–15 semantic/LSI keywords found within the transcript or highly relevant to the discussed topics.
+            4. Predict the full content structure of the video (what sections it likely contains)
+            5. Classify the intent (Educational, Entertainment, Transactional)
+            6. Write a clean, short context summary that will help a Python script decide which keywords to scrape from YouTube.
+
+            DO NOT generate a new title or description here.
+            Only return the context and keyword predictions.
+
+            Output Format (JSON ONLY):
+            {{
+              "topic": "...",
+              "primary_keyword": "...",
+              "lsi_keywords": ["keyword1", "keyword2", ...],
+              "content_structure": ["Section 1", "Section 2", ...],
+              "intent": "...",
+              "context_summary": "..."
+            }}
+            """
+        
         try:
-            return json.loads(cleaned_text)
-        except:
-            logger.warning(f"Failed to parse JSON: {text[:100]}...")
+            return call_llm_with_json_retry(
+                system_prompt, 
+                user_prompt,
+                validation_callback=lambda x: "primary_keyword" in x
+            )
+        except Exception as final_e:
+            logger.error(f"All LLM attempts failed: {final_e}")
             return {"primary_keyword": title, "lsi_keywords": [title], "context_summary": "Analysis failed."}
 
 def deep_expand(seeds: list, target_count=50):
@@ -349,7 +457,14 @@ def deep_expand(seeds: list, target_count=50):
                 queue.append(s_clean)
                 if len(collected) >= target_count: break
         time.sleep(0.05)
-    return list(collected)
+    # Deduplicate while preserving order
+    seen = set()
+    final_list = []
+    for item in collected:
+        if item not in seen:
+            seen.add(item)
+            final_list.append(item)
+    return final_list
 
 @retry_with_backoff(retries=5, backoff_in_seconds=10)
 def generate_final_metadata(primary_keyword: str, lsi_keywords: list, scraped_keywords: list, context_summary: str, old_links: list, transcript: str, duration: int):
@@ -358,11 +473,11 @@ def generate_final_metadata(primary_keyword: str, lsi_keywords: list, scraped_ke
     links_str = "\n".join(old_links)
     transcript_context = ""
     if transcript:
-        # Provide more transcript for chapters, maybe 30000 chars or full if model handles it.
-        # Llama 3.1 8B has 128k context, so we can pass a lot.
-        transcript_context = f"\nFull Video Transcript for Chapter Generation:\n{transcript[:30000]}\n"
+        # Provide more transcript for chapters, maybe 10000 chars or full if model handles it.
+        # Local models often have 4k context, so keep it safe.
+        transcript_context = f"\nFull Video Transcript for Chapter Generation:\n{transcript[:10000]}\n"
 
-    system_prompt = "You are an expert YouTube Strategist. Return ONLY a valid JSON object."
+    system_prompt = "You are an expert YouTube Strategist. Return ONLY a valid JSON object. Do not include any conversational text, markdown formatting, or explanations."
     user_prompt = f"""
     I will give you the following inputs:
     Primary keyword: {primary_keyword}
@@ -421,25 +536,84 @@ def generate_final_metadata(primary_keyword: str, lsi_keywords: list, scraped_ke
     }}
     """
     
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.7,
-        timeout=90,
-    )
-    text = response.choices[0].message.content
-    cleaned_text = clean_json_text(text)
     try:
-        return json.loads(cleaned_text)
-    except json.JSONDecodeError:
-        cleaned_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_text)
+        return call_llm_with_json_retry(
+            system_prompt, 
+            user_prompt,
+            validation_callback=lambda x: "titles" in x and isinstance(x["titles"], list)
+        )
+    except Exception as e:
+        logger.warning(f"LLM generation failed with full context: {e}. Retrying with truncated context...")
+        # Fallback
+        if transcript:
+             transcript_context = f"\nFull Video Transcript for Chapter Generation:\n{transcript[:5000]}\n"
+             # Re-construct user prompt with smaller transcript
+             user_prompt = f"""
+    I will give you the following inputs:
+    Primary keyword: {primary_keyword}
+    LSI keywords: {', '.join(lsi_keywords)}
+    Scraped YouTube/Google keyword suggestions: {', '.join(scraped_keywords)}
+    Original context summary: {context_summary}
+    Links to preserve:
+    {links_str}
+    
+    {transcript_context}
+
+    Using all inputs, generate final optimized YouTube metadata by following these steps:
+
+    1. Create 3 Highly-Optimized Titles
+    SEO-focused title (front-load keyword, under 60 chars)
+    CTR/viral title (curiosity gap, emotional trigger, still accurate)
+    Balanced title (CTR + SEO combined)
+
+    2. Write a Fully Optimized Description
+    Must include:
+    2-line SEO hook with primary keyword
+    200–250 word mini-blog body using semantic keywords
+    IMPORTANT: You MUST include the provided "Links to preserve" at the end of the description or where appropriate.
+    Strong CTA
+    
+    3. Generate Chapters/Timestamps (MANDATORY)
+    Video Duration: {duration} seconds.
+    
+    Rules:
+    - You MUST generate chapters.
+    - If Duration < 60 seconds (Shorts): Generate exactly one timestamp "0:00 - [Engaging Hook]".
+    - If Duration >= 60 seconds: Generate 3+ chapters (Intro, Key Points, Conclusion).
+    - If Transcript is missing: INFER chapters based on the Title, Description, and Context. Do NOT skip this step.
+    - Format: 00:00 - Chapter Title
+
+
+    4. Generate Tags & Hashtags
+    15–20 tags (mix of broad, niche, long-tail, misspellings)
+    Exactly 3–5 hashtags
+
+    5. Thumbnail Direction
+    Create a visual concept that matches the strongest title.
+
+    Output Format (JSON ONLY):
+    {{
+      "titles": [
+        {{"type": "SEO", "text": "..."}},
+        {{"type": "Viral", "text": "..."}},
+        {{"type": "Balanced", "text": "..."}}
+      ],
+      "description": "...",
+      "chapters": "00:00 - Intro...",
+      "tags": ["tag1", "tag2", ...],
+      "hashtags": ["#tag1", "#tag2", ...],
+      "thumbnail_direction": "..."
+    }}
+    """
+
         try:
-            return json.loads(cleaned_text)
-        except:
-            logger.warning(f"Failed to parse JSON: {text[:100]}...")
+            return call_llm_with_json_retry(
+                system_prompt, 
+                user_prompt,
+                validation_callback=lambda x: "titles" in x and isinstance(x["titles"], list)
+            )
+        except Exception as final_e:
+            logger.error(f"All LLM attempts failed: {final_e}")
             return {}
 
 # --- Worker Function ---
@@ -494,19 +668,46 @@ def process_single_row(row, index, total):
         # Combine Description and Chapters
         final_description = metadata.get("description", "")
         chapters = metadata.get("chapters", "")
+        
+        # Normalize chapters if list
+        if isinstance(chapters, list):
+            chapters = "\n".join(chapters)
+            
         if chapters:
             final_description += f"\n\nTimestamps:\n{chapters}"
             
+        # Sanitize tags and hashtags (ensure list of strings)
+        def sanitize_list(lst):
+            if not isinstance(lst, list): return []
+            clean = []
+            for item in lst:
+                if isinstance(item, str):
+                    clean.append(item)
+                elif isinstance(item, dict):
+                    # Extract values if it's a dict like {"tag": "value"} or just take the first value
+                    clean.extend([str(v) for v in item.values() if isinstance(v, (str, int, float))])
+                else:
+                    clean.append(str(item))
+            return clean
+
         updated_row["New Description"] = final_description
-        updated_row["New Tags"] = ", ".join(metadata.get("tags", []))
-        updated_row["New Hashtags"] = ", ".join(metadata.get("hashtags", []))
+        updated_row["New Tags"] = ", ".join(sanitize_list(metadata.get("tags", [])))
+        updated_row["New Hashtags"] = ", ".join(sanitize_list(metadata.get("hashtags", [])))
         updated_row["Thumbnail Direction"] = metadata.get("thumbnail_direction", "")
         updated_row["Primary Keyword"] = primary_kw
         updated_row["Context Summary"] = context
         
+        # Only mark success if we actually got an optimized title
+        if seo_title:
+            updated_row["Status"] = "Success"
+        else:
+            updated_row["Status"] = "Failed"
+            logger.warning(f"Row {index} marked Failed: No SEO title generated.")
+        
         return updated_row
     except Exception as e:
         logger.error(f"Error processing row {index}: {e}")
+        row["Status"] = "Failed"
         return row
 
 # --- Main Processing Logic ---
@@ -546,17 +747,22 @@ def process_file(input_file, output_file, max_workers=1):
                 df_output = pd.read_csv(output_file)
             
             # Check which IDs are *successfully* processed
-            if "Video ID" in df_output.columns:
+            if "Video ID" in df_output.columns and "Status" in df_output.columns:
                 for index, row in df_output.iterrows():
                     vid_id = str(row.get("Video ID", ""))
-                    # Check if it was an error or empty
-                    context = str(row.get("Context Summary", ""))
-                    seo_title = str(row.get("Optimized Title (SEO)", ""))
+                    status = str(row.get("Status", ""))
                     
-                    if context != "Error." and seo_title != "nan" and seo_title != "":
+                    if status == "Success":
                         processed_ids.add(vid_id)
                 
                 logger.info(f"Already successfully processed {len(processed_ids)} videos.")
+            elif "Video ID" in df_output.columns:
+                 # Legacy check for older files without Status column
+                 for index, row in df_output.iterrows():
+                    vid_id = str(row.get("Video ID", ""))
+                    seo_title = str(row.get("Optimized Title (SEO)", ""))
+                    if not pd.isna(seo_title) and seo_title != "" and seo_title.lower() != "nan":
+                         processed_ids.add(vid_id)
         except Exception as e:
             logger.warning(f"Could not read existing output file: {e}. Starting fresh.")
 
@@ -615,15 +821,15 @@ def process_file(input_file, output_file, max_workers=1):
                     final_results.append(result_row)
                     completed_count += 1
                     
-                    # Real-time saving: Save every 1 row (since user asked for real-time)
-                    # For performance on large files, maybe every 5 is better, but let's do 1 for safety.
-                    if completed_count % 1 == 0:
-                        logger.info(f"Progress: {completed_count}/{total} - Saving...")
+                    # Real-time saving: Save every 5 rows
+                    if completed_count % 5 == 0:
+                        logger.info(f"Progress: {completed_count}/{total} - Saving batch...")
                         temp_df = pd.DataFrame(final_results)
                         out_ext = os.path.splitext(output_file)[1].lower()
                         temp_output_file = output_file + ".tmp"
                         
                         if out_ext == '.xlsx':
+                            # Prefer CSV for intermediate if possible, but stick to requested format
                             temp_df.to_excel(temp_output_file, index=False)
                         else:
                             temp_df.to_csv(temp_output_file, index=False)
@@ -633,6 +839,21 @@ def process_file(input_file, output_file, max_workers=1):
 
             except Exception as e:
                 logger.error(f"Row {i} failed: {e}")
+                
+        # Final save for any remaining rows
+        if completed_count % 5 != 0:
+             logger.info(f"Final Save... ({completed_count}/{total})")
+             with lock:
+                temp_df = pd.DataFrame(final_results)
+                out_ext = os.path.splitext(output_file)[1].lower()
+                temp_output_file = output_file + ".tmp"
+                
+                if out_ext == '.xlsx':
+                    temp_df.to_excel(temp_output_file, index=False)
+                else:
+                    temp_df.to_csv(temp_output_file, index=False)
+                
+                shutil.move(temp_output_file, output_file)
 
     logger.info("All tasks completed.")
 

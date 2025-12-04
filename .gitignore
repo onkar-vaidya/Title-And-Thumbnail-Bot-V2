@@ -4,5 +4,7 @@ __pycache__/
 venv/
 .DS_Store
 test_output*.csv
+test_input_final.csv
+final_output_batch.csv
 temp_*
 *.tmp
